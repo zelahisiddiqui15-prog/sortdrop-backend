@@ -94,12 +94,26 @@ def classify():
     prompt = f"""You are a music file classifier for a producer tool called SortDrop.
 
 Analyze this filename and return a JSON object with these fields:
-- category: the main sound category (Bass, Lead, Pad, Pluck, FX, Drum, Vocal, Chord, Arp, Texture, Ambient, or Other)
+- category: the main sound category. Choose from: Bass, Lead, Pad, Pluck, FX, Drum, Vocal, Chord, Arp, Guitar, Piano, Strings, Brass, Synth, Texture, Ambient, Loop, or Other.
 - subcategory: a more specific description (e.g. "Midrange Bass", "Supersaw Lead")
 - key: musical key if detectable from filename (e.g. "Am", "C#", "Fm") or null
 - bpm: BPM if detectable from filename as a number or null
 - file_type: one of "stem", "preset", "midi", "sample", "loop"
 - confidence: your confidence score from 0 to 1
+
+Classification rules (follow strictly):
+- If filename contains "GTR", "Gtr", "Guitar", "guitar" → category = "Guitar"
+- If filename contains "BASS", "Bass", "bass" → category = "Bass"
+- If filename contains "DRUM", "Drum", "drum", "PERC", "Perc" → category = "Drum"
+- If filename contains "VOX", "Vox", "VOCAL", "Vocal", "vocal" → category = "Vocal"
+- If filename contains "PAD", "Pad", "pad" → category = "Pad"
+- If filename contains "LEAD", "Lead", "lead" → category = "Lead"
+- If filename contains "CHORD", "Chord", "chord" → category = "Chord"
+- If filename contains "FX", "fx", "SFX", "sfx" → category = "FX"
+- If filename contains "SYNTH", "Synth", "synth" → category = "Synth"
+- If filename contains "PIANO", "Piano", "piano", "PNO" → category = "Piano"
+- Prioritize instrument type over file type — a guitar loop is "Guitar", not "Loop"
+- Only use "Loop" if no instrument type can be identified
 
 Filename: {filename}
 
@@ -113,7 +127,6 @@ Return ONLY valid JSON with no markdown, no code fences, no explanation. Just th
 
     try:
         raw = message.content[0].text.strip()
-        # Strip markdown code fences if present
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
