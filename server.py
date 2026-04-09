@@ -193,7 +193,18 @@ def stripe_webhook():
     return jsonify({"status": "ok"})
 
 
-if __name__ == "__main__":
-    init_db()
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+@app.route("/stripe/create-checkout-session", methods=["POST"])
+def create_checkout_session():
+    data = request.json or {}
+    user_id = data.get("user_id")
+    try:
+        session = stripe.checkout.Session.create(
+            ui_mode="embedded",
+            line_items=[{"price": os.getenv("STRIPE_PRICE_ID"), "quantity": 1}],
+            mode="subscription",
+            return_url=f"https://www.cratify.app/dashboard?session_id={{CHECKOUT_SESSION_ID}}",
+            client_reference_id=user_id,
+        )
+        return jsonify({"clientSecret": session.client_secret})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
