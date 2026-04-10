@@ -147,7 +147,7 @@ Return ONLY valid JSON. No markdown, no explanation."""
     message = anthropic_client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=256,
-        messages=[{{"role": "user", "content": prompt}}]
+        messages=[{"role": "user", "content": prompt}]
     )
 
     try:
