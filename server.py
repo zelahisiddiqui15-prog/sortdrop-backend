@@ -225,7 +225,14 @@ def chat():
 
         # Extract filenames from reply - look for .wav/.mp3 etc patterns
         import re
+        # Match full filenames with extensions
         found_files = re.findall(r'[\w&#+\-\.\(\)\[\]\s]+\.(?:wav|mp3|aiff|aif|flac|mid|midi|fxp|vital)', reply, re.IGNORECASE)
+        # Also match FILE: lines without extension
+        file_lines = re.findall(r'\*{0,2}FILE:\*{0,2}\s*([^\n|]+)', reply, re.IGNORECASE)
+        for f in file_lines:
+            f = f.strip()
+            if f and f not in found_files:
+                found_files.append(f)
         found_files = [f.strip() for f in found_files]
 
         return jsonify({"reply": reply, "found_files": found_files})
