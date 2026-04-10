@@ -3,4 +3,4 @@ flask-cors
 anthropic
 python-dotenv
 psycopg2-binary
-stripe
+stripe>=7.0.0
