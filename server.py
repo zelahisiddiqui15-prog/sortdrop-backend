@@ -13,7 +13,19 @@ from models import (init_db, create_user, get_user, get_user_by_email,
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    return response
+
+@app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
+@app.route('/<path:path>', methods=['OPTIONS'])
+def handle_options(path):
+    return '', 204
 
 anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
@@ -209,6 +221,80 @@ def create_checkout_session():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+_INTENT_SYSTEM = """You parse music producer chat messages into structured bulk file actions.
+
+Return ONLY a valid JSON object — no explanation, no markdown fences.
+
+Supported actions: "export" (copy files to a destination folder) or "move" (move files).
+Return action: null if the message is just a search or question, not a bulk operation.
+
+Output schema:
+{
+  "action": "export" | "move" | null,
+  "filter": {
+    "key":      string | null,   // musical key, e.g. "C# minor", "Am", "G major"
+    "category": string | null,   // e.g. "loop", "bass", "drum", "vocal", "pad"
+    "bpm_min":  number | null,
+    "bpm_max":  number | null,
+    "file_type": string | null   // extension without dot: "wav", "mp3", "midi"
+  },
+  "destination": string | null   // absolute path the user mentioned, or null
+}
+
+Decision rules:
+- "export / send / copy … to …"  → action: "export"
+- "move … to …"                  → action: "move"
+- "show / find / search / what"  → action: null
+- Vague questions with no clear destination → action: null
+- If destination folder is not explicitly stated → destination: null
+
+Examples:
+  "export all my C# minor loops to /Users/zee/Desktop"
+  → {"action":"export","filter":{"key":"C# minor","category":"loop","bpm_min":null,"bpm_max":null,"file_type":null},"destination":"/Users/zee/Desktop"}
+
+  "move all bass wav files to /Users/zee/Music/Project"
+  → {"action":"move","filter":{"key":null,"category":"bass","bpm_min":null,"bpm_max":null,"file_type":"wav"},"destination":"/Users/zee/Music/Project"}
+
+  "send everything between 120 and 130 bpm to my desktop"
+  → {"action":"export","filter":{"key":null,"category":null,"bpm_min":120,"bpm_max":130,"file_type":null},"destination":"/Users/zee/Desktop"}
+
+  "show me all loops in Am"
+  → {"action":null,"filter":{},"destination":null}
+
+  "find dark pads in C minor"
+  → {"action":null,"filter":{},"destination":null}
+"""
+
+
+@app.route("/intent", methods=["POST"])
+def intent():
+    """Parse a chat message for bulk file action intent using Claude Haiku."""
+    data = request.json or {}
+    message = data.get("message", "").strip()
+    if not message:
+        return jsonify({"action": None})
+    try:
+        resp = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            system=_INTENT_SYSTEM,
+            messages=[{"role": "user", "content": message}]
+        )
+        raw = resp.content[0].text.strip()
+        # Strip markdown fences if model wraps anyway
+        if raw.startswith("```"):
+            raw = "\n".join(raw.split("\n")[1:])
+            raw = raw.rsplit("```", 1)[0]
+        result = json.loads(raw.strip())
+        # Normalise: always return the top-level action key
+        if "action" not in result:
+            result["action"] = None
+        return jsonify(result)
+    except Exception as e:
+        print(f"[/intent] error: {e}", flush=True)
+        return jsonify({"action": None})
+
+
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.json
@@ -238,6 +324,127 @@ def chat():
         return jsonify({"reply": reply, "found_files": found_files})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+_PAIR_MAP = {
+    "kick":      ["snare", "clap", "hi-hat", "hihat"],
+    "bass":      ["pad", "lead", "pluck"],
+    "lead":      ["pad", "arp"],
+    "loop":      ["drum loop", "bass"],
+}
+
+@app.route("/pair", methods=["POST"])
+def pair():
+    """Given a filepath + category, return top 5 complementary files from target categories."""
+    data = request.json or {}
+    filepath = data.get("filepath", "").strip()
+    category = (data.get("category") or "").strip().lower()
+
+    if not filepath or not category:
+        return jsonify({"error": "filepath and category required"}), 400
+
+    # Determine target categories from pairing map
+    target_cats = None
+    for key, targets in _PAIR_MAP.items():
+        if key in category:
+            target_cats = targets
+            break
+    if not target_cats:
+        return jsonify({"error": f"no pairing defined for category '{category}'"}), 400
+
+    try:
+        import sqlite3 as _sqlite3
+        import numpy as _np
+        import base64 as _b64
+        from pathlib import Path as _Path
+        from scipy.spatial.distance import cosine as _cosine
+
+        db_path = str(_Path.home() / ".cratify" / "index.db")
+
+        # Load embedding for the query file
+        conn = _sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("SELECT embedding FROM files WHERE filepath = ?", (filepath,))
+        row = c.fetchone()
+        conn.close()
+
+        if not row or not row[0]:
+            return jsonify({"error": "no embedding found for this file — run indexer first"}), 404
+
+        query_emb = _np.frombuffer(row[0], dtype=_np.float32)
+
+        # Build SQL LIKE clause for target categories (case-insensitive)
+        placeholders = " OR ".join(["LOWER(category) LIKE ?" for _ in target_cats])
+
+        conn2 = _sqlite3.connect(db_path)
+        c2 = conn2.cursor()
+        c2.execute(
+            f"SELECT filepath, filename, category, key, bpm, embedding FROM files "
+            f"WHERE embedding IS NOT NULL AND filepath != ? AND ({placeholders})",
+            [filepath] + [f"%{t}%" for t in target_cats],
+        )
+        candidates = c2.fetchall()
+        conn2.close()
+
+        results = []
+        for fp, fn, cat, key, bpm, emb_blob in candidates:
+            try:
+                emb = _np.frombuffer(emb_blob, dtype=_np.float32)
+                sim = float(1.0 - _cosine(query_emb, emb))
+                results.append({
+                    "filepath": fp,
+                    "filename": fn,
+                    "category": cat or "",
+                    "key": key or "",
+                    "bpm": bpm,
+                    "similarity": round(sim, 4),
+                })
+            except Exception:
+                continue
+
+        results.sort(key=lambda x: x["similarity"], reverse=True)
+        return jsonify({"pairs": results[:5], "target_categories": target_cats})
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/embed", methods=["POST"])
+def embed():
+    """Generate a 52-dim audio embedding (40 MFCC + 12 chroma) for a local file path."""
+    data = request.json or {}
+    filepath = data.get("filepath", "").strip()
+    if not filepath:
+        return jsonify({"error": "filepath required"}), 400
+
+    import os as _os
+    if not _os.path.isfile(filepath):
+        return jsonify({"error": "file not found"}), 404
+
+    try:
+        import librosa
+        import numpy as np
+        import base64
+
+        y, sr = librosa.load(filepath, sr=22050, mono=True, duration=30)
+        if len(y) < 1024:
+            return jsonify({"error": "audio too short"}), 400
+
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
+        mfcc_mean = np.mean(mfcc, axis=1)  # shape (40,)
+
+        chroma = librosa.feature.chroma_stft(y=y, sr=sr)
+        chroma_mean = np.mean(chroma, axis=1)  # shape (12,)
+
+        embedding = np.concatenate([mfcc_mean, chroma_mean]).astype(np.float32)  # shape (52,)
+        encoded = base64.b64encode(embedding.tobytes()).decode("ascii")
+        return jsonify({"embedding": encoded, "dims": len(embedding)})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
     import sys
