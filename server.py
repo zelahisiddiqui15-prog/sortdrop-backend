@@ -309,17 +309,41 @@ def chat():
         )
         reply = message.content[0].text.strip()
 
-        # Extract filenames from reply - look for .wav/.mp3 etc patterns
+        # Extract filenames from reply - multiple patterns to catch all formats
         import re
-        # Match full filenames with extensions
-        found_files = re.findall(r'[\w&#+\-\.\(\)\[\]\s]+\.(?:wav|mp3|aiff|aif|flac|mid|midi|fxp|vital)', reply, re.IGNORECASE)
-        # Also match FILE: lines without extension
+        _EXT = r'(?:wav|mp3|aiff|aif|flac|mid|midi|fxp|vital|serum)'
+
+        # Pattern 1: bare filenames anywhere in text (word chars + common punctuation + extension)
+        bare = re.findall(
+            rf'[\w&#+\-\.\(\)\[\]\s]+\.{_EXT}',
+            reply, re.IGNORECASE)
+
+        # Pattern 2: numbered list lines  e.g. "1. filename.wav" or "1) filename.wav"
+        numbered = re.findall(
+            rf'^\s*\d+[.\)]\s+([\w&#+\-\.\(\)\[\] ]+\.{_EXT})',
+            reply, re.IGNORECASE | re.MULTILINE)
+
+        # Pattern 3: dashed list lines  e.g. "- filename.wav" or "• filename.wav"
+        dashed = re.findall(
+            rf'^\s*[-•]\s+([\w&#+\-\.\(\)\[\] ]+\.{_EXT})',
+            reply, re.IGNORECASE | re.MULTILINE)
+
+        # Pattern 4: quoted filenames  e.g. "filename.wav" or 'filename.wav'
+        quoted = re.findall(
+            rf'["\']+([\w&#+\-\.\(\)\[\] ]+\.{_EXT})["\']',
+            reply, re.IGNORECASE)
+
+        # Pattern 5: FILE: lines (may have markdown asterisks around FILE)
         file_lines = re.findall(r'\*{0,2}FILE:\*{0,2}\s*([^\n|]+)', reply, re.IGNORECASE)
-        for f in file_lines:
+
+        # Merge all hits, deduplicate preserving order
+        seen = set()
+        found_files = []
+        for f in bare + numbered + dashed + quoted + file_lines:
             f = f.strip()
-            if f and f not in found_files:
+            if f and f not in seen:
+                seen.add(f)
                 found_files.append(f)
-        found_files = [f.strip() for f in found_files]
 
         return jsonify({"reply": reply, "found_files": found_files})
     except Exception as e:
