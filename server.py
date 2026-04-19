@@ -530,7 +530,7 @@ The user's library samples (pre-ranked by similarity, ID in brackets):
     parsed = None
     candidates_to_try = []
 
-    fence = _re.search(r'```(?:json)?\s*(\{.*?\})\s*```', reply_text, _re.DOTALL)
+    fence = _re.search(r'```(?:json)?\s*(\{.*\})\s*```', reply_text, _re.DOTALL)
     if fence:
         candidates_to_try.append(fence.group(1))
 
