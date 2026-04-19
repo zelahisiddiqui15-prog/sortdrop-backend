@@ -5,12 +5,6 @@ import stripe
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
-import voyageai
-import re as _re
-
-VOYAGE_CLIENT = voyageai.Client(api_key=os.environ.get("VOYAGE_API_KEY"))
-EMBED_MODEL = "voyage-4-lite"
-EMBED_DIMENSION = 512
 from models import (init_db, create_user, get_user, get_user_by_email,
                     get_user_by_username, username_exists, get_db,
                     increment_sorts, activate_subscription,
@@ -333,6 +327,60 @@ def intent():
         return jsonify({"action": None})
 
 
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.json
+    messages = data.get("messages", [])
+    system = data.get("system", "")
+    try:
+        message = anthropic_client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=2000,
+            system=system,
+            messages=messages
+        )
+        reply = message.content[0].text.strip()
+
+        # Extract filenames from reply - multiple patterns to catch all formats
+        import re
+        _EXT = r'(?:wav|mp3|aiff|aif|flac|mid|midi|fxp|vital|serum)'
+
+        # Pattern 1: bare filenames anywhere in text (word chars + common punctuation + extension)
+        bare = re.findall(
+            rf'[\w&#+\-\.\(\)\[\]\s]+\.{_EXT}',
+            reply, re.IGNORECASE)
+
+        # Pattern 2: numbered list lines  e.g. "1. filename.wav" or "1) filename.wav"
+        numbered = re.findall(
+            rf'^\s*\d+[.\)]\s+([\w&#+\-\.\(\)\[\] ]+\.{_EXT})',
+            reply, re.IGNORECASE | re.MULTILINE)
+
+        # Pattern 3: dashed list lines  e.g. "- filename.wav" or "• filename.wav"
+        dashed = re.findall(
+            rf'^\s*[-•]\s+([\w&#+\-\.\(\)\[\] ]+\.{_EXT})',
+            reply, re.IGNORECASE | re.MULTILINE)
+
+        # Pattern 4: quoted filenames  e.g. "filename.wav" or 'filename.wav'
+        quoted = re.findall(
+            rf'["\']+([\w&#+\-\.\(\)\[\] ]+\.{_EXT})["\']',
+            reply, re.IGNORECASE)
+
+        # Pattern 5: FILE: lines (may have markdown asterisks around FILE)
+        file_lines = re.findall(r'\*{0,2}FILE:\*{0,2}\s*([^\n|]+)', reply, re.IGNORECASE)
+
+        # Merge all hits, deduplicate preserving order
+        seen = set()
+        found_files = []
+        for f in bare + numbered + dashed + quoted + file_lines:
+            f = f.strip()
+            if f and f not in seen:
+                seen.add(f)
+                found_files.append(f)
+
+        return jsonify({"reply": reply, "found_files": found_files})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 _PAIR_MAP = {
     "kick":      ["snare", "clap", "hi-hat", "hihat"],
     "bass":      ["pad", "lead", "pluck"],
@@ -420,134 +468,38 @@ def pair():
 
 @app.route("/embed", methods=["POST"])
 def embed():
-    """Generate text embeddings via Voyage AI for semantic search."""
-    data = request.get_json(force=True) or {}
-    texts = data.get("texts", [])
-    input_type = data.get("input_type", "document")
+    """Generate a 52-dim audio embedding (40 MFCC + 12 chroma) for a local file path."""
+    data = request.json or {}
+    filepath = data.get("filepath", "").strip()
+    if not filepath:
+        return jsonify({"error": "filepath required"}), 400
 
-    if not texts:
-        return jsonify({"embeddings": []})
-
-    BATCH = 128
-    all_embeddings = []
-    for i in range(0, len(texts), BATCH):
-        chunk = texts[i:i+BATCH]
-        try:
-            result = VOYAGE_CLIENT.embed(
-                chunk,
-                model=EMBED_MODEL,
-                input_type=input_type,
-                output_dimension=EMBED_DIMENSION,
-            )
-            all_embeddings.extend(result.embeddings)
-        except Exception as e:
-            print(f"[embed] chunk {i} failed: {e}", flush=True)
-            return jsonify({"error": str(e)}), 500
-
-    return jsonify({
-        "embeddings": all_embeddings,
-        "model": EMBED_MODEL,
-        "dimension": EMBED_DIMENSION,
-    })
-
-
-@app.route("/search", methods=["POST"])
-def search():
-    """Semantic search: client sends top-50 candidates by cosine similarity,
-    Claude re-ranks, writes an explanation, and returns structured filters."""
-    data = request.get_json(force=True) or {}
-    query = (data.get("query") or "").strip()
-    candidates = data.get("candidates", [])
-    conversation = data.get("conversation", [])
-
-    if not query:
-        return jsonify({"error": "empty query"}), 400
-
-    if not candidates:
-        return jsonify({
-            "picks": [],
-            "filters_used": {},
-            "reply": "Your library has no samples indexed yet.",
-            "broad_count": 0,
-        })
-
-    candidates_text = "\n".join(
-        f"[{c['id']}] {c['meta_text']}"
-        for c in candidates[:50]
-    )
-
-    system_prompt = f"""You are Cratify, an AI music producer assistant. You help producers find the perfect sample from their personal library.
-
-The user will ask for sounds. You have been given the top-50 most semantically similar samples from their library, pre-ranked by vector similarity. Your job is to:
-
-1. Analyze the samples and identify the 4-8 best actual matches
-2. Write a brief, confident explanation (2-4 sentences) of what matches and why, like a trusted producer friend
-3. Return structured filter criteria that describe the broader category (for a "see more" button)
-
-ALWAYS respond in this EXACT JSON format, no prose outside:
-{{{{
-  "picks": [
-    {{{{"id": 47, "score": 0.94, "reason": "exact key + BPM match, dark vocal texture"}}}}
-  ],
-  "reply": "Found 4 vocal chops matching that brief - all in Gm or its relative major Bb, sitting between 128-145 BPM...",
-  "filters_used": {{{{
-    "category": "Vocals",
-    "key": "Gm",
-    "bpm_min": 128,
-    "bpm_max": 145,
-    "tags": ["dark", "airy"]
-  }}}}
-}}}}
-
-Rules:
-- scores are 0.0-1.0 representing match quality confidence
-- reply should feel like a producer friend who knows music theory - mention relative major/minor when relevant, pitch-adjust tolerances, layering advice
-- filters_used describes the broader search the user might want - be permissive, it is an escape hatch
-- If fewer than 4 samples truly match, return fewer picks. Quality over quantity.
-- If nothing matches well, return picks: [] and reply honestly
-- Any filter field can be null/omitted if not inferrable
-- category MUST be one of: Drums, Bass, Synth, Leads, Vocals, FX, Loops, One-Shots, Keys, Percussion, Other
-
-The user's library samples (pre-ranked by similarity, ID in brackets):
-{{candidates_text}}
-"""
-
-    anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    messages = conversation + [{"role": "user", "content": query}]
+    import os as _os
+    if not _os.path.isfile(filepath):
+        return jsonify({"error": "file not found"}), 404
 
     try:
-        response = anthropic_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1200,
-            system=system_prompt,
-            messages=messages,
-        )
+        import librosa
+        import numpy as np
+        import base64
+
+        y, sr = librosa.load(filepath, sr=22050, mono=True, duration=30)
+        if len(y) < 1024:
+            return jsonify({"error": "audio too short"}), 400
+
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
+        mfcc_mean = np.mean(mfcc, axis=1)  # shape (40,)
+
+        chroma = librosa.feature.chroma_stft(y=y, sr=sr)
+        chroma_mean = np.mean(chroma, axis=1)  # shape (12,)
+
+        embedding = np.concatenate([mfcc_mean, chroma_mean]).astype(np.float32)  # shape (52,)
+        encoded = base64.b64encode(embedding.tobytes()).decode("ascii")
+        return jsonify({"embedding": encoded, "dims": len(embedding)})
     except Exception as e:
-        return jsonify({"error": f"claude_failed: {e}"}), 500
-
-    reply_text = response.content[0].text.strip()
-
-    fence = _re.search(r'```(?:json)?\s*(\{.*\})\s*```', reply_text, _re.DOTALL)
-    if fence:
-        reply_text = fence.group(1)
-
-    try:
-        parsed = json.loads(reply_text)
-    except json.JSONDecodeError:
-        return jsonify({
-            "picks": [],
-            "filters_used": {},
-            "reply": reply_text,
-            "broad_count": 0,
-            "error": "parse_failed",
-        })
-
-    return jsonify({
-        "picks": parsed.get("picks", []),
-        "filters_used": parsed.get("filters_used", {}),
-        "reply": parsed.get("reply", ""),
-        "broad_count": 0,
-    })
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
