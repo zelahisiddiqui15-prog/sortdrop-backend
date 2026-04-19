@@ -478,39 +478,58 @@ def search():
 
     system_prompt = """You are Cratify, an AI music producer assistant. You help producers find the perfect sample from their personal library.
 
-The user will ask for sounds. You have been given the top-50 most semantically similar samples from their library, pre-ranked by vector similarity. Your job is to:
+The user will ask for sounds. You have been given the top-50 most semantically similar samples from their library, pre-ranked by vector similarity. Your job is to analyze them, identify the best matches, write a concise producer-friendly explanation, and infer the broader filter criteria for a "see more" button.
 
-1. Analyze the samples and identify the 4-8 best actual matches
-2. Write a CONCISE, scannable explanation — max 3-4 short sentences. Use 1-2 sentences per idea, break into clean paragraphs with blank lines between. Write like a text message to a producer friend, not an essay. NO run-on sentences. Break it up visually.
-3. Return structured filter criteria that describe the broader category (for a "see more" button)
-
-ALWAYS respond in this EXACT JSON format, no prose outside:
-{
-  "picks": [
-    {"id": 47, "score": 0.94, "reason": "exact key + BPM match, dark vocal texture"}
-  ],
-  "reply": "Found 4 solid vocal chops.\n\nAll in Gm or its relative major Bb, sitting 128-145 BPM so they'll pitch-adjust cleanly to your tempo.\n\nThe top two are tagged #dark #airy — should sit under heavier bass without clashing.",
-  "filters_used": {
-    "category": "Vocals",
-    "key": "Gm",
-    "bpm_min": 128,
-    "bpm_max": 145,
-    "tags": ["dark", "airy"]
-  }
-}
-
-Rules:
-- NEVER mention the [ID] numbers in your reply text — those are internal. Refer to samples by their filename or a short descriptor ("the F wub one-shot", "that Cm kick") when writing the reply.
-- scores are 0.0-1.0 representing match quality confidence
-- reply should feel like a producer friend who knows music theory - mention relative major/minor when relevant, pitch-adjust tolerances, layering advice
-- filters_used describes the broader search the user might want - be permissive, it is an escape hatch
-- If fewer than 4 samples truly match, return fewer picks. Quality over quantity.
-- If nothing matches well, return picks: [] and reply honestly
-- Any filter field can be null/omitted if not inferrable
+Guidelines for your response:
+- picks: identify the 4-8 best actual matches. If fewer than 4 truly match, return fewer. If nothing matches well, return empty list.
+- reply: write like a text message to a producer friend. Max 3-4 short sentences across 2-3 short paragraphs separated by blank lines. NO run-on sentences. Mention relative major/minor when relevant, pitch-adjust tolerances, layering advice.
+- NEVER mention the [ID] numbers in your reply text. Refer to samples by filename or short descriptor ("the F wub one-shot", "that Cm kick").
+- filters_used: describes the broader search the user might want ("all vocal chops in Gm around 140 BPM") - be permissive, it's an escape hatch. Any field can be omitted if not inferrable.
 - category MUST be one of: Drums, Bass, Synth, Leads, Vocals, FX, Loops, One-Shots, Keys, Percussion, Other
+
+You MUST respond by calling the return_search_results tool. Do not respond with text.
 
 The user's library samples (pre-ranked by similarity, ID in brackets):
 """ + candidates_text
+
+    SEARCH_TOOL_SCHEMA = {
+        "name": "return_search_results",
+        "description": "Return ranked sample picks with an explanation and inferred filters.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "picks": {
+                    "type": "array",
+                    "description": "Best matching samples, 0-8 items, ranked by relevance.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "integer", "description": "Sample ID from the candidates list."},
+                            "score": {"type": "number", "description": "Match quality 0.0-1.0."},
+                            "reason": {"type": "string", "description": "Short phrase explaining why this matches."},
+                        },
+                        "required": ["id", "score", "reason"],
+                    },
+                },
+                "reply": {
+                    "type": "string",
+                    "description": "Producer-friendly explanation, 2-3 short paragraphs separated by blank lines.",
+                },
+                "filters_used": {
+                    "type": "object",
+                    "description": "Broader filter criteria the user might want (for 'see more' button).",
+                    "properties": {
+                        "category": {"type": "string"},
+                        "key": {"type": "string"},
+                        "bpm_min": {"type": "integer"},
+                        "bpm_max": {"type": "integer"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+            "required": ["picks", "reply", "filters_used"],
+        },
+    }
 
     anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     messages = conversation + [{"role": "user", "content": query}]
@@ -521,77 +540,32 @@ The user's library samples (pre-ranked by similarity, ID in brackets):
             max_tokens=2000,
             system=system_prompt,
             messages=messages,
+            tools=[SEARCH_TOOL_SCHEMA],
+            tool_choice={"type": "tool", "name": "return_search_results"},
         )
     except Exception as e:
+        print(f"[search] claude call failed: {e}", flush=True)
         return jsonify({"error": f"claude_failed: {e}"}), 500
 
-    reply_text = response.content[0].text.strip()
-
-    # Strip any leading/trailing markdown fences unconditionally before parsing.
-    # Some Claude responses end without the closing ``` (truncation or trailing
-    # whitespace weirdness), which breaks regex-based fence extraction.
-    if reply_text.startswith("```"):
-        first_nl = reply_text.find("\n")
-        if first_nl != -1:
-            reply_text = reply_text[first_nl+1:]
-    if reply_text.rstrip().endswith("```"):
-        reply_text = reply_text.rstrip()[:-3].rstrip()
-
-    parsed = None
-    candidates_to_try = []
-
-    # Legacy fence regex kept as fallback if the above strip missed.
-    fence = _re.search(r'```(?:json)?\s*(\{.*\})\s*```', reply_text, _re.DOTALL)
-    if fence:
-        candidates_to_try.append(fence.group(1))
-
-    first_brace = reply_text.find('{')
-    if first_brace != -1:
-        depth = 0
-        end = -1
-        in_str = False
-        escape = False
-        for i in range(first_brace, len(reply_text)):
-            ch = reply_text[i]
-            if escape:
-                escape = False
-                continue
-            if ch == '\\':
-                escape = True
-                continue
-            if ch == '"':
-                in_str = not in_str
-                continue
-            if in_str:
-                continue
-            if ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        if end > first_brace:
-            candidates_to_try.append(reply_text[first_brace:end])
-
-    candidates_to_try.append(reply_text)
-
-    for candidate in candidates_to_try:
-        try:
-            parsed = json.loads(candidate)
+    # Extract the tool_use block. With tool_choice forcing this tool, Claude
+    # MUST return a tool_use block with validated input matching the schema.
+    tool_use = None
+    for block in response.content:
+        if block.type == "tool_use" and block.name == "return_search_results":
+            tool_use = block
             break
-        except json.JSONDecodeError:
-            continue
 
-    if parsed is None:
-        print(f"[search] JSON parse failed. Raw reply (len={len(reply_text)}): {reply_text}", flush=True)
+    if tool_use is None:
+        print(f"[search] no tool_use block returned. Content: {response.content}", flush=True)
         return jsonify({
             "picks": [],
             "filters_used": {},
             "reply": "Sorry, I had trouble formatting that response. Try rephrasing your search.",
             "broad_count": 0,
-            "error": "parse_failed",
+            "error": "no_tool_use",
         })
+
+    parsed = tool_use.input  # guaranteed dict matching schema
 
     return jsonify({
         "picks": parsed.get("picks", []),
