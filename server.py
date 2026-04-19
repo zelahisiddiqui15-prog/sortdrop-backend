@@ -527,9 +527,20 @@ The user's library samples (pre-ranked by similarity, ID in brackets):
 
     reply_text = response.content[0].text.strip()
 
+    # Strip any leading/trailing markdown fences unconditionally before parsing.
+    # Some Claude responses end without the closing ``` (truncation or trailing
+    # whitespace weirdness), which breaks regex-based fence extraction.
+    if reply_text.startswith("```"):
+        first_nl = reply_text.find("\n")
+        if first_nl != -1:
+            reply_text = reply_text[firsnl+1:]
+    if reply_text.rstrip().endswith("```"):
+        reply_text = reply_text.rstrip()[:-3].rstrip()
+
     parsed = None
     candidates_to_try = []
 
+    # Legacy fence regex kept as fallback if the above strip missed.
     fence = _re.search(r'```(?:json)?\s*(\{.*\})\s*```', reply_text, _re.DOTALL)
     if fence:
         candidates_to_try.append(fence.group(1))
