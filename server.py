@@ -516,17 +516,26 @@ CRITICAL RULES:
 - STRICT FORMAT: <key> · <BPM> · <2-3 vibe tags>
 - USE BULLET SEPARATOR: · (middle dot, U+00B7) between sections
 - MAX 8 WORDS TOTAL
-- Use producer key shorthand: "Gm" not "G minor", "F#" not "F sharp", "Am" not "A minor", etc.
+- ACCEPT ANY KEY FORMAT in input. Producers write keys many ways. ALL of these mean the same key:
+    "G", "GMaj", "G Maj", "GMajor", "G Major", "G-Major", "Major G", "g maj", "g major" → all = G major
+    "Gm", "Gmin", "G min", "G Minor", "G-Minor", "Minor G", "g minor" → all = G minor
+    Same applies to every key (F#, Bb, C#, etc.). When the modifier is missing or ambiguous, default to MAJOR.
+- EMIT keys in ONE strict output format only:
+    Major keys → "<Note>Maj"  (examples: "GMaj", "F#Maj", "BbMaj", "CMaj", "DMaj")
+    Minor keys → "<Note>m"    (examples: "Gm", "F#m", "Bbm", "Cm", "Dm")
 - BPM: integer or short range like "128" or "120-130"
 - Vibe tags: 1-3 short tags like "dark", "melancholic", "uplifting", "trap", "dubstep", "afro house"
 
-EXAMPLES:
+EXAMPLES (note the consistent output format):
 "Gm · 128 BPM · dark trap"
-"F# · 140 BPM · dubstep, melancholic"
+"GMaj · 155 BPM · melodic dubstep"
+"F#m · 140 BPM · dubstep, melancholic"
+"DMaj · 120 BPM · uplifting, melodic"
 "Am · 90/180 BPM · afro house"
 "Em · ~125 BPM · progressive, uplifting"
+"BbMaj · 110 BPM · jazzy, warm"
 
-If you cannot determine a section, omit it. E.g. if no key is clear: "128 BPM · dark trap". If only key is clear: "Gm · melancholic".
+If you cannot determine a section, omit it. E.g. if no key is clear: "128 BPM · dark trap". If only key is clear: "GMaj · melancholic".
 
 If neither notes nor chat history give you anything to work with, return an empty string.
 
