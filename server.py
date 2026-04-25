@@ -451,6 +451,128 @@ def embed():
     })
 
 
+@app.route("/summarize_project", methods=["POST"])
+def summarize_project():
+    """Generate a 1-liner project summary for the sidebar.
+
+    Notes are the source of truth (the project brief).
+    Chat history layers on evolution — but dominant patterns win
+    over one-off tangents.
+
+    Request body:
+      {
+        "notes": "G minor sad/melancholic with two drops" (str),
+        "messages": [
+          {"role": "user", "content": "find me an arp"},
+          {"role": "assistant", "content": "..."},
+          ...
+        ]  (list, last ~20 messages, can be empty)
+      }
+
+    Response:
+      { "summary": "G min · 128 BPM · dark/melancholic" }
+
+    Cost: ~$0.0015 per call (Haiku 4.5).
+    """
+    data = request.get_json(force=True) or {}
+    notes = (data.get("notes") or "").strip()
+    messages = data.get("messages", [])
+
+    # If we have neither notes nor messages, return empty — nothing
+    # to summarize. Client falls back to first line of notes (which
+    # is also empty in this case, so sidebar shows nothing).
+    if not notes and not messages:
+        return jsonify({"summary": ""})
+
+    # Build the chat transcript section. Cap at last 20 messages
+    # to keep token count predictable. Skip empty messages.
+    transcript_lines = []
+    for m in messages[-20:]:
+        role = m.get("role", "")
+        content = (m.get("content") or "").strip()
+        if not content or role not in ("user", "assistant"):
+            continue
+        # Trim each message to ~200 chars to stay focused on intent
+        if len(content) > 200:
+            content = content[:200] + "..."
+        prefix = "User" if role == "user" else "AI"
+        transcript_lines.append(f"{prefix}: {content}")
+    transcript = "\n".join(transcript_lines) if transcript_lines else "(no chat history yet)"
+
+    notes_block = notes if notes else "(no notes provided)"
+
+    system_prompt = """You are a music producer's assistant generating a glanceable 1-line summary of a song project for a sidebar UI.
+
+The producer needs to scan a list of 5-15 active song projects and immediately remember what each one is about. Your output is the entire 1-liner shown under the project name.
+
+YOU WILL RECEIVE:
+1. PROJECT NOTES — the producer's explicit brief (highest priority, treat as source of truth)
+2. RECENT CHAT HISTORY — messages between the producer and the AI inside this project (use to surface dominant patterns, NOT to chase recent tangents)
+
+CRITICAL RULES:
+- NOTES ARE THE ANCHOR. If notes say "G minor", the summary stays G minor even if recent messages mention other keys.
+- DOMINANT PATTERNS WIN. If user discussed key X across 8 messages and key Y in 1 message, summary uses key X. Tangents do not shift the summary.
+- BE TERSE. Producer shorthand only. No adjectives like "really" / "kind of" / "very" / "with".
+- STRICT FORMAT: <key> · <BPM> · <2-3 vibe tags>
+- USE BULLET SEPARATOR: · (middle dot, U+00B7) between sections
+- MAX 8 WORDS TOTAL
+- Use producer key shorthand: "Gm" not "G minor", "F#" not "F sharp", "Am" not "A minor", etc.
+- BPM: integer or short range like "128" or "120-130"
+- Vibe tags: 1-3 short tags like "dark", "melancholic", "uplifting", "trap", "dubstep", "afro house"
+
+EXAMPLES:
+"Gm · 128 BPM · dark trap"
+"F# · 140 BPM · dubstep, melancholic"
+"Am · 90/180 BPM · afro house"
+"Em · ~125 BPM · progressive, uplifting"
+
+If you cannot determine a section, omit it. E.g. if no key is clear: "128 BPM · dark trap". If only key is clear: "Gm · melancholic".
+
+If neither notes nor chat history give you anything to work with, return an empty string.
+
+Respond with ONLY the 1-liner. No quotes, no explanation, no preamble."""
+
+    user_prompt = f"""PROJECT NOTES:
+{notes_block}
+
+RECENT CHAT HISTORY (last 20 messages, oldest first):
+{transcript}
+
+Generate the 1-liner."""
+
+    try:
+        anthropic_client = anthropic.Anthropic(
+            api_key=os.environ["ANTHROPIC_API_KEY"]
+        )
+        response = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=60,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+    except Exception as e:
+        print(f"[summarize_project] claude call failed: {e}", flush=True)
+        return jsonify({"error": f"claude_failed: {e}"}), 500
+
+    # Extract text from the response. Haiku returns text content blocks.
+    summary = ""
+    for block in response.content:
+        if hasattr(block, "text"):
+            summary += block.text
+    summary = summary.strip()
+
+    # Defensive cleanup: strip surrounding quotes if Claude added them,
+    # collapse whitespace, cap length so a misbehaving response can't
+    # blow out the sidebar.
+    summary = summary.strip('"').strip("'").strip()
+    summary = " ".join(summary.split())  # collapse internal whitespace
+    if len(summary) > 80:
+        summary = summary[:77] + "..."
+
+    print(f"[summarize_project] summary: {summary!r}", flush=True)
+    return jsonify({"summary": summary})
+
+
 @app.route("/search", methods=["POST"])
 def search():
     """Semantic search: client sends top-50 candidates by cosine similarity,
